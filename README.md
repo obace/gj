@@ -4,6 +4,6 @@ apt install vim -y
 
 vim /etc/crontab
 
-00 04 * * * root /root/gua.sh
+00 04 * * * root /root/tm.sh
 
 service cron restart
