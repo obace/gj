@@ -1,6 +1,6 @@
 wget https://raw.githubusercontent.com/obace/gj/main/gua.sh && chmod +x gua.sh   &&  bash gua.sh
 
-apt install vim -y
+apt install -y vim
 
 vim /etc/crontab
 
