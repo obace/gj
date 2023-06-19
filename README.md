@@ -1,6 +1,4 @@
-wget https://raw.githubusercontent.com/obace/gj/main/gua.sh && chmod +x gua.sh
-
-bash gua.sh
+wget https://raw.githubusercontent.com/obace/gj/main/gua.sh && chmod +x gua.sh   &&  bash gua.sh
 
 apt install vim -y
 
