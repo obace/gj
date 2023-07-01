@@ -1,9 +1,5 @@
+apt update -y  &&  apt install -y curl   &&    apt install -y socat  &&    apt install -y vim
+
 wget https://raw.githubusercontent.com/obace/gj/main/gua.sh && chmod +x gua.sh   &&  bash gua.sh
 
-apt install -y vim
-
-vim /etc/crontab
-
-0 0 * * 0 root /root/gua.sh
-
-service cron restart
+(sudo crontab -l ; echo "0 7 * * 1 sleep \$((RANDOM \% 3600)) && /bin/bash /root/gua.sh") | sudo crontab -
