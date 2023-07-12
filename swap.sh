@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# 检测是否存在虚拟内存
+if grep -q '/swapfile' /etc/fstab; then
+    echo "虚拟内存已存在，脚本终止运行。"
+    exit 0
+fi
+
 # 创建交换文件
 sudo fallocate -l 2G /swapfile
 sudo chmod 600 /swapfile
