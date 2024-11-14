@@ -9,10 +9,6 @@ echo "net.ipv6.conf.lo.disable_ipv6 = 1" | sudo tee -a /etc/sysctl.conf > /dev/n
 # 使 sysctl 配置生效
 sudo sysctl -p
 
-# 禁用 IPv6 模块
-echo "禁用 IPv6 模块..."
-echo "blacklist ipv6" | sudo tee -a /etc/modprobe.d/blacklist.conf > /dev/null
-
 # 重启网络服务（如果适用）
 echo "重启网络服务..."
 if systemctl is-active --quiet NetworkManager; then
