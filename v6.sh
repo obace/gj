@@ -13,9 +13,15 @@ sudo sysctl -p
 echo "禁用 IPv6 模块..."
 echo "blacklist ipv6" | sudo tee -a /etc/modprobe.d/blacklist.conf > /dev/null
 
-# 重启网络服务使设置生效
+# 尝试重启适当的网络服务
 echo "重启网络服务..."
-sudo systemctl restart networking
+if systemctl is-active --quiet NetworkManager; then
+    sudo systemctl restart NetworkManager
+elif systemctl is-active --quiet systemd-networkd; then
+    sudo systemctl restart systemd-networkd
+else
+    echo "未找到合适的网络服务，系统可能需要重启才能完全应用配置。"
+fi
 
 # 提示完成
 echo "IPv6 已成功禁用！"
