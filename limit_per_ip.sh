@@ -1,71 +1,110 @@
 #!/bin/bash
 
-# 脚本描述：限制网卡 ens5 上每个 IP 的下载速度到 100Mbps
+# 颜色定义
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+PLAIN="\033[0m"
 
-# 设置变量
-INTERFACE="ens5"  # 你的网卡名称
-RATE="100mbit"    # 每个 IP 的限速为 100Mbps
-IP_RANGE=${1:-"none"}  # 可选参数指定 IP 范围，例如 192.168.1.0/24
-
-# 检查 root 权限
-if [ "$EUID" -ne 0 ]; then
-  echo "请以 root 权限运行：sudo $0 [IP_RANGE]"
-  exit 1
-fi
-
-# 检查 tc
-if ! command -v tc &> /dev/null; then
-  echo "安装 iproute2..."
-  apt update && apt install -y iproute2 || { echo "安装失败"; exit 1; }
-fi
-
-# 清除旧规则
-echo "清除 $INTERFACE 旧规则..."
-tc qdisc del dev $INTERFACE root 2>/dev/null
-
-# 添加 HTB 队列
-echo "设置 HTB 队列..."
-tc qdisc add dev $INTERFACE root handle 1: htb default 9999 || { echo "队列设置失败"; exit 1; }
-
-# 获取 IP 列表
-if [ "$IP_RANGE" == "none" ]; then
-  echo "检测活动 IP（使用 netstat）..."
-  IPS=$(netstat -tn | grep ESTABLISHED | awk '{print $5}' | cut -d: -f1 | sort -u)
-  if [ -z "$IPS" ]; then
-    echo "未检测到活动连接，可能需要指定 IP 范围（例如 192.168.1.0/24）。"
-    echo "当前 ARP 表："
-    arp -i $INTERFACE
+# 检查是否为root用户
+if [ "$(id -u)" != "0" ]; then
+    echo -e "${RED}错误: 必须使用root用户运行此脚本!${PLAIN}"
     exit 1
-  fi
-else
-  if ! command -v ipcalc &> /dev/null; then
-    echo "安装 ipcalc..."
-    apt install -y ipcalc || { echo "安装失败"; exit 1; }
-  fi
-  IPS=$(ipcalc $IP_RANGE | grep Host | awk '{print $2}')
 fi
 
-# 调试：显示检测到的 IP
-echo "检测到的 IP 列表：$IPS"
+# 检查系统是否为Debian/Ubuntu
+if ! [ -f /etc/debian_version ]; then
+    echo -e "${RED}错误: 此脚本仅支持Debian/Ubuntu系统!${PLAIN}"
+    exit 1
+fi
 
-# 设置限速
-CLASS_ID=10
-for IP in $IPS; do
-  if [[ $IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "限制 IP $IP 到 $RATE..."
-    tc class add dev $INTERFACE parent 1: classid 1:$CLASS_ID htb rate $RATE || echo "添加 class 失败: $IP"
-    tc filter add dev $INTERFACE protocol ip parent 1: prio 1 u32 match ip src $IP flowid 1:$CLASS_ID || echo "添加 filter 失败: $IP"
-    CLASS_ID=$((CLASS_ID + 1))
-  else
-    echo "跳过无效 IP: $IP"
-  fi
+echo -e "${GREEN}开始安装必要的软件包...${PLAIN}"
+apt update
+apt install -y iproute2 iptables
+
+# 创建限速脚本
+cat > /usr/local/bin/limit-ip-speed.sh << 'EOF'
+#!/bin/bash
+
+# 网卡名称
+IFACE="ens5"
+
+# 清除已有规则
+tc qdisc del dev $IFACE root 2>/dev/null
+iptables -t mangle -F
+
+# 创建根队列规则
+tc qdisc add dev $IFACE root handle 1: htb default 10
+
+# 创建主类
+tc class add dev $IFACE parent 1: classid 1:1 htb rate 100Gbit
+
+# 获取所有已连接的IP
+CONNECTED_IPS=$(netstat -ntu | awk '{print $5}' | cut -d: -f1 | grep -v '^[[:space:]]*$' | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' | sort -u)
+
+# 为每个IP创建限速规则
+for IP in $CONNECTED_IPS
+do
+    # 获取标记号(使用IP的哈希值作为标记，避免冲突)
+    MARK=$(echo $IP | md5sum | cut -c1-4)
+    MARK=$((16#$MARK)) # 转换为十进制
+    
+    # 创建100Mbps的子类
+    tc class add dev $IFACE parent 1:1 classid 1:$MARK htb rate 100Mbit ceil 100Mbit
+    
+    # 创建过滤器
+    tc filter add dev $IFACE protocol ip parent 1:0 prio 1 handle $MARK fw flowid 1:$MARK
+    
+    # 添加iptables标记
+    iptables -t mangle -A POSTROUTING -d $IP -j MARK --set-mark $MARK
 done
 
-# 显示规则
-echo "当前 tc 规则："
-tc qdisc show dev $INTERFACE
-tc class show dev $INTERFACE
-tc filter show dev $INTERFACE
+# 显示当前规则
+echo "Current TC rules:"
+tc -s qdisc ls dev $IFACE
+echo -e "\nCurrent IP marks:"
+iptables -t mangle -L POSTROUTING -n -v
+EOF
 
-echo "完成！每个 IP 下载速度应限制为 100Mbps。"
-echo "取消限速：tc qdisc del dev $INTERFACE root"
+# 添加执行权限
+chmod +x /usr/local/bin/limit-ip-speed.sh
+
+# 创建systemd服务
+cat > /etc/systemd/system/ip-speed-limit.service << 'EOF'
+[Unit]
+Description=IP Speed Limit Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/limit-ip-speed.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 创建定时任务以定期更新规则
+cat > /etc/cron.d/ip-speed-limit << 'EOF'
+*/5 * * * * root /usr/local/bin/limit-ip-speed.sh
+EOF
+
+# 启用并启动服务
+systemctl daemon-reload
+systemctl enable ip-speed-limit
+systemctl start ip-speed-limit
+
+echo -e "${GREEN}安装完成!${PLAIN}"
+echo -e "${YELLOW}已经设置以下内容:${PLAIN}"
+echo "1. 创建了限速脚本: /usr/local/bin/limit-ip-speed.sh"
+echo "2. 创建了系统服务: ip-speed-limit"
+echo "3. 添加了定时任务每5分钟更新一次规则"
+echo -e "\n${YELLOW}当前限速规则:${PLAIN}"
+tc -s qdisc ls dev ens5
+
+echo -e "\n${YELLOW}使用以下命令可以管理服务:${PLAIN}"
+echo "systemctl status ip-speed-limit  # 查看服务状态"
+echo "systemctl stop ip-speed-limit    # 停止服务"
+echo "systemctl start ip-speed-limit   # 启动服务"
+echo "systemctl restart ip-speed-limit # 重启服务"
