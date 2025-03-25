@@ -20,7 +20,7 @@ IFACE_DEFAULT=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || ip li
 [ -z "$IFACE_DEFAULT" ] && echo -e "${RED}错误：${PLAIN}无法自动检测网卡，请检查网络配置" && exit 1
 # 可选：手动指定网卡（取消注释并替换为你的网卡名称）
 # IFACE_DEFAULT="ens5"
-RATE=${RATE:-"200mbit"}  # 每个 IP 的带宽限制
+RATE=${RATE:-"200mbit"}  # 每个 IP 和默认类的带宽限制
 BURST=${BURST:-"15k"}    # 突发流量
 LOG_FILE="/var/log/bandwidth-limit.log"
 
@@ -96,7 +96,7 @@ tc qdisc add dev \$IFACE root handle 1: htb default 999 || {
     log "错误：创建 tc qdisc 失败"
     exit 1
 }
-tc class add dev \$IFACE parent 1: classid 1:999 htb rate 10gbit  # 默认类不限制
+tc class add dev \$IFACE parent 1: classid 1:999 htb rate \$RATE burst \$BURST  # 默认类也限制为 200mbit
 
 # 获取当前所有已建立连接的唯一 IP 地址 (TCP 和 UDP)
 CONNECTED_IPS=\$(ss -tn state established '( dport != :22 )' | awk 'NR>1 {print \$4}' | cut -d: -f1 | sort -u)
@@ -282,7 +282,7 @@ show_usage() {
     echo -e "${YELLOW}使用说明:${PLAIN}"
     echo -e " 1. 限速脚本每5秒自动运行"
     echo -e " 2. 每个 IP 的带宽限制为 ${GREEN}$RATE${PLAIN}"
-    echo -e " 3. 总带宽无限制，取决于连接数"
+    echo -e " 3. 未匹配的流量也限制为 ${GREEN}$RATE${PLAIN}"
     echo -e ""
     echo -e "${YELLOW}可用命令:${PLAIN}"
     echo -e " - ${GREEN}监控带宽使用情况:${PLAIN}"
