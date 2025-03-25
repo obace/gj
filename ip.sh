@@ -18,6 +18,8 @@ PLAIN='\033[0m'
 # 自动检测网卡名称
 IFACE_DEFAULT=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || ip link | grep -E '^[0-9]+: ' | grep -v 'lo:' | head -n1 | awk '{print $2}' | cut -d: -f1)
 [ -z "$IFACE_DEFAULT" ] && echo -e "${RED}错误：${PLAIN}无法自动检测网卡，请检查网络配置" && exit 1
+# 可选：手动指定网卡（取消注释并替换为你的网卡名称）
+# IFACE_DEFAULT="ens5"
 RATE=${RATE:-"200mbit"}  # 每个 IP 的带宽限制
 BURST=${BURST:-"15k"}    # 突发流量
 LOG_FILE="/var/log/bandwidth-limit.log"
@@ -83,7 +85,7 @@ log() {
     echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1" >> \$LOG_FILE
 }
 
-log "开始执行带宽限制..."
+log "开始执行带宽限制，网卡: \$IFACE"
 
 # 检查网卡是否有效
 [ -z "\$IFACE" ] && log "错误：无法检测到网卡" && exit 1
@@ -100,6 +102,8 @@ tc class add dev \$IFACE parent 1: classid 1:999 htb rate 10gbit  # 默认类不
 CONNECTED_IPS=\$(ss -tn state established '( dport != :22 )' | awk 'NR>1 {print \$4}' | cut -d: -f1 | sort -u)
 CONNECTED_IPS+=" \$(ss -un | awk 'NR>1 {print \$5}' | cut -d: -f1 | sort -u)"
 CONNECTED_IPS=\$(echo "\$CONNECTED_IPS" | tr ' ' '\n' | sort -u)
+
+log "检测到的 IP 列表: \$CONNECTED_IPS"
 
 # 为所有 IP 创建限速类
 IP_COUNT=1
@@ -199,10 +203,10 @@ EOF
     
     cat > /etc/systemd/system/ip-bandwidth-limiter.timer << 'EOF'
 [Unit]
-Description=Run IP Bandwidth Limiter every 10 seconds
+Description=Run IP Bandwidth Limiter every 5 seconds
 
 [Timer]
-OnCalendar=*:*:0/10
+OnCalendar=*:*:0/5
 Persistent=true
 Unit=ip-bandwidth-limiter@%i.service
 
@@ -276,7 +280,7 @@ show_usage() {
     echo -e "${CYAN}=====================================${PLAIN}"
     echo -e ""
     echo -e "${YELLOW}使用说明:${PLAIN}"
-    echo -e " 1. 限速脚本每10秒自动运行"
+    echo -e " 1. 限速脚本每5秒自动运行"
     echo -e " 2. 每个 IP 的带宽限制为 ${GREEN}$RATE${PLAIN}"
     echo -e " 3. 总带宽无限制，取决于连接数"
     echo -e ""
