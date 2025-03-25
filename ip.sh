@@ -90,7 +90,7 @@ log "开始执行带宽限制..."
 
 # 清理旧规则并初始化 HTB qdisc
 tc qdisc del dev \$IFACE root 2>/dev/null
-tc qdisc add dev \$IFACE root handle 1: htb defaultThe 999 || {
+tc qdisc add dev \$IFACE root handle 1: htb default 999 || {
     log "错误：创建 tc qdisc 失败"
     exit 1
 }
@@ -284,7 +284,7 @@ show_usage() {
     echo -e " - ${GREEN}监控带宽使用情况:${PLAIN}"
     echo -e "   ${CYAN}bash /usr/local/scripts/monitor-bandwidth.sh${PLAIN}"
     echo -e " - ${GREEN}手动运行限速脚本:${PLAIN}"
-    echo -e "   ${CYAN}bash /主要安装流程bash /usr/local/scripts/ip-bandwidth-limiter.sh${PLAIN}"
+    echo -e "   ${CYAN}bash /usr/local/scripts/ip-bandwidth-limiter.sh${PLAIN}"
     echo -e " - ${GREEN}查看限速日志:${PLAIN}"
     echo -e "   ${CYAN}cat /var/log/bandwidth-limit.log${PLAIN}"
     echo -e " - ${RED}卸载限速器:${PLAIN}"
