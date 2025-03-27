@@ -3,6 +3,7 @@
 # IP-Bandwidth-Limiter
 # 一键为每个连接的 IP 设置带宽限制
 # 适用于运行 X-UI 和 Hysteria 2 的 Debian/Ubuntu 服务器
+# 修改版：排除落地 IP，不限制其带宽
 #
 
 # 颜色定义
@@ -20,9 +21,10 @@ IFACE_DEFAULT=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || ip li
 [ -z "$IFACE_DEFAULT" ] && echo -e "${RED}错误：${PLAIN}无法自动检测网卡，请检查网络配置" && exit 1
 # 可选：手动指定网卡（取消注释并替换为你的网卡名称）
 # IFACE_DEFAULT="ens5"
-RATE=${RATE:-"150mbit"}  # 每个 IP 和默认类的带宽限制
+RATE=${RATE:-"150mbit"}  # 每个 IP 的带宽限制设为 100Mbps
 BURST=${BURST:-"15k"}    # 突发流量
 LOG_FILE="/var/log/bandwidth-limit.log"
+EXCLUDED_IP="172.31.76.73"  # 请替换为你的落地 IP
 
 # 检查是否为 root 用户
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：${PLAIN}必须使用 root 用户运行此脚本！\n" && exit 1
@@ -71,14 +73,15 @@ create_limiter_script() {
 #!/bin/bash
 #
 # IP-Bandwidth-Limiter
-# 为每个连接的 IP 设置带宽限制
+# 为每个连接的 IP 设置带宽限制，排除落地 IP
 #
 
 # 配置参数
 IFACE=\${IFACE:-"$IFACE_DEFAULT"}
-RATE="200mbit"
-BURST="15k"
-LOG_FILE="/var/log/bandwidth-limit.log"
+RATE="$RATE"
+BURST="$BURST"
+LOG_FILE="$LOG_FILE"
+EXCLUDED_IP="$EXCLUDED_IP"  # 落地 IP，不限速
 
 # 记录日志函数
 log() {
@@ -96,7 +99,7 @@ tc qdisc add dev \$IFACE root handle 1: htb default 999 || {
     log "错误：创建 tc qdisc 失败"
     exit 1
 }
-tc class add dev \$IFACE parent 1: classid 1:999 htb rate \$RATE burst \$BURST  # 默认类也限制为 200mbit
+tc class add dev \$IFACE parent 1: classid 1:999 htb rate 1000mbit  # 默认类不限速（设为高值）
 
 # 获取当前所有已建立连接的唯一 IP 地址 (TCP 和 UDP)
 CONNECTED_IPS=\$(ss -tn state established '( dport != :22 )' | awk 'NR>1 {print \$4}' | cut -d: -f1 | sort -u)
@@ -108,6 +111,12 @@ log "检测到的 IP 列表: \$CONNECTED_IPS"
 # 为所有 IP 创建限速类
 IP_COUNT=1
 for IP in \$CONNECTED_IPS; do
+    # 跳过落地 IP
+    if [ "\$IP" = "\$EXCLUDED_IP" ]; then
+        log "跳过落地 IP: \$IP"
+        continue
+    fi
+    
     # 跳过私有 IP 和无效 IP
     if [[ \$IP =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|::1|fe80::|fc00::|fd00::|ff00::) ]] || \
        ! [[ \$IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$ ]] && ! [[ \$IP =~ ^[0-9a-fA-F:]+\$ ]]; then
@@ -281,8 +290,8 @@ show_usage() {
     echo -e ""
     echo -e "${YELLOW}使用说明:${PLAIN}"
     echo -e " 1. 限速脚本每5秒自动运行"
-    echo -e " 2. 每个 IP 的带宽限制为 ${GREEN}$RATE${PLAIN}"
-    echo -e " 3. 未匹配的流量也限制为 ${GREEN}$RATE${PLAIN}"
+    echo -e " 2. 每个 IP 的带宽限制为 ${GREEN}$RATE${PLAIN}（落地 IP $EXCLUDED_IP 除外）"
+    echo -e " 3. 未匹配的流量不限速"
     echo -e ""
     echo -e "${YELLOW}可用命令:${PLAIN}"
     echo -e " - ${GREEN}监控带宽使用情况:${PLAIN}"
@@ -303,7 +312,7 @@ main() {
     echo -e "${CYAN}    IP 带宽限速器 安装程序    ${PLAIN}"
     echo -e "${CYAN}=====================================${PLAIN}"
     echo -e ""
-    echo -e "${YELLOW}此脚本将为每个连接的 IP 设置 $RATE 带宽限制${PLAIN}"
+    echo -e "${YELLOW}此脚本将为每个连接的 IP 设置 $RATE 带宽限制（落地 IP $EXCLUDED_IP 除外）${PLAIN}"
     echo -e "${YELLOW}自动检测到的网卡: $IFACE_DEFAULT${PLAIN}"
     echo -e ""
     
