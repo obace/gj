@@ -1,13 +1,12 @@
 #!/bin/bash
 #
-# IP-Bandwidth-Limiter (Optimized - Include All IPs)
-# 一键为每个连接的 IP 设置带宽限制
-# 适用于运行 X-UI 和 Hysteria 2 的 Debian/Ubuntu 服务器
-# 修改版：限制所有检测到的公共 IP 带宽
+# IP-Bandwidth-Limiter Installer (Optimized - Include All IPs)
+# Installs a service to limit bandwidth per IP for all detected public IPs.
+# Uses lock file and improved logging in the worker script.
 #
 
-# --- 配置参数 (可编辑) ---
-# 自动检测网卡名称
+# --- 配置参数 (!!! 请在此处编辑 !!!) ---
+# 自动检测网卡名称 (通常无需更改)
 IFACE_DEFAULT=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || ip link | grep -E '^[0-9]+: ' | grep -v 'lo:' | head -n1 | awk '{print $2}' | cut -d: -f1)
 # 可选：手动指定网卡 (取消注释并替换)
 # IFACE_DEFAULT="eth0"
@@ -15,8 +14,9 @@ IFACE_DEFAULT=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || ip li
 RATE=${RATE:-"150mbit"}  # 每个 IP 的带宽限制 (e.g., 100mbit, 500kbit)
 BURST=${BURST:-"15k"}    # 突发流量 (e.g., 15k)
 LOG_FILE="/var/log/bandwidth-limit.log"
-# EXCLUDED_IP is NOT used in this version
-TIMER_INTERVAL="5" # 定时器运行频率（秒）
+# EXCLUDED_IP=""  # 在此版本中，保持此行为空或注释掉，以限制所有 IP
+EXCLUDED_IP="" # Explicitly empty for clarity in service environment
+TIMER_INTERVAL="15" # 定时器运行频率（秒）- 建议 15 秒或以上
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -42,6 +42,7 @@ check_interface() {
     else
          echo -e "${BLUE}信息：${PLAIN}自动检测到的网络接口: $IFACE_DEFAULT"
     fi
+    # No EXCLUDED_IP check needed for this version
 }
 
 # 检查 root 权限
@@ -74,6 +75,8 @@ check_install() {
 
     if [ -n "$missing_pkgs" ]; then
         echo -e "${YELLOW}警告：${PLAIN} 缺少软件包: $missing_pkgs. 正在尝试安装..."
+        # Disable frontend interaction
+        export DEBIAN_FRONTEND=noninteractive
         if command -v apt-get &>/dev/null; then
             apt-get update -y && apt-get install -y $missing_pkgs
         elif command -v apt &>/dev/null; then
@@ -95,110 +98,210 @@ check_install() {
     fi
 
     if command -v vnstat &>/dev/null; then
-        systemctl enable vnstat &>/dev/null
-        systemctl start vnstat &>/dev/null
+         # Ensure vnstat service is running and enabled
+        if ! systemctl is-active --quiet vnstat; then
+             systemctl start vnstat &>/dev/null
+        fi
+         if ! systemctl is-enabled --quiet vnstat; then
+             systemctl enable vnstat &>/dev/null
+        fi
     fi
 
     echo -e "${GREEN}[成功]${PLAIN} 所有必要的软件包已就绪。"
 }
 
-# 创建限速脚本
+# 创建限速脚本 (包含锁文件和改进日志记录的 Worker Script)
 create_limiter_script() {
-    echo -e "${BLUE}[信息]${PLAIN} 创建限速脚本..."
+    echo -e "${BLUE}[信息]${PLAIN} 创建限速工作脚本..."
     mkdir -p /usr/local/scripts
 
-    # Note: The inner script inherits IFACE_DEFAULT, RATE, BURST, LOG_FILE from the outer script context
+    # Worker script content - applies to both versions now due to internal check
     cat > /usr/local/scripts/ip-bandwidth-limiter.sh << EOF
 #!/bin/bash
 #
-# IP-Bandwidth-Limiter (Worker Script - Limit All IPs)
-# 为每个连接的 IP 设置带宽限制
+# IP-Bandwidth-Limiter (Worker Script - MODIFIED with Lockfile & Better Logging)
+# Sets bandwidth limits for connected IPs.
 #
 
-# --- 配置 (从主脚本继承/设置) ---
+# --- Configuration (Inherited from Installer/Set Here) ---
 IFACE="$IFACE_DEFAULT"
 RATE="$RATE"
 BURST="$BURST"
 LOG_FILE="$LOG_FILE"
-# EXCLUDED_IP is NOT used in this version
+EXCLUDED_IP="$EXCLUDED_IP" # Will be empty if installer doesn't set it
+LOCK_FILE="/run/ip-limiter-\${IFACE:-default}.lock" # Use /run for runtime state, specific lock per interface
 
-# --- 内部函数 ---
-# 记录日志函数
+# --- Functions ---
+# Logging Function
 log() {
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1" >> \$LOG_FILE
+    # Add timestamp to log message
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1" >> "\$LOG_FILE"
 }
 
-# --- 主逻辑 ---
-log "开始执行带宽限制 (限制所有检测到的IP), 网卡: \$IFACE, 速率: \$RATE"
+# Cleanup function to remove lock file on exit
+cleanup() {
+    # Only remove lock if this PID owns it
+    if [ -f "\$LOCK_FILE" ] && [ "\$(cat "\$LOCK_FILE")" = "\$\$" ]; then
+        log "Script exiting (PID \$\$). Removing lock file: \$LOCK_FILE"
+        rm -f "\$LOCK_FILE"
+    fi
+}
 
-# 检查网卡是否有效
-if ! ip link show "\$IFACE" &>/dev/null; then
-    log "错误：网卡 \$IFACE 不存在或无效。"
-    exit 1
+# --- Main Logic ---
+
+# Set trap to ensure cleanup function is called on script exit (normal or signaled)
+trap cleanup EXIT INT TERM HUP
+
+# --- Lock File Handling ---
+# Create /run if it doesn't exist (relevant in minimal containers)
+mkdir -p /run
+
+# Check if lock file exists and if the process holding the lock is still running
+if [ -e "\$LOCK_FILE" ]; then
+    # Read the PID from the lock file
+    OTHER_PID=\$(cat "\$LOCK_FILE")
+    # Check if the PID is valid and the process is running (kill -0 checks existence)
+    if [ -n "\$OTHER_PID" ] && kill -0 "\$OTHER_PID" 2>/dev/null; then
+        log "WARN: Another instance (PID \$OTHER_PID) is already running. Exiting to prevent conflict."
+        # Exit gracefully without error, as this is expected behavior with locking
+        exit 0
+    else
+        # The process is no longer running, or PID is invalid. Remove stale lock file.
+        log "WARN: Stale lock file found (PID \$OTHER_PID invalid or process gone). Removing it."
+        rm -f "\$LOCK_FILE"
+    fi
 fi
 
-# 清理旧规则并初始化 HTB qdisc
-tc qdisc del dev \$IFACE root 2>/dev/null
-tc qdisc add dev \$IFACE root handle 1: htb default 999 || {
-    log "错误：创建根 tc qdisc 失败"
+# Create the lock file and store the current PID
+echo "\$\$" > "\$LOCK_FILE"
+# Check if lock file was created successfully and owned by us
+if ! [ -f "\$LOCK_FILE" ] || ! [ "\$(cat "\$LOCK_FILE")" = "\$\$" ]; then
+     log "CRITICAL ERROR: Failed to create or own lock file '\$LOCK_FILE'. Exiting."
+     exit 1
+fi
+log "Script started (PID \$\$). Created lock file."
+
+# --- Script Core Logic ---
+# Determine script mode based on whether EXCLUDED_IP variable is set and non-empty
+if [ -z "\${EXCLUDED_IP+x}" ] || [ -z "\$EXCLUDED_IP" ]; then
+    log "Mode: Limit All IPs. 网卡: \$IFACE, 速率: \$RATE"
+    EXCLUSION_ACTIVE=false
+else
+    # This block should ideally not be reached in the "Include All" version, but handles it safely
+    log "Mode: Exclude Landing IP ($EXCLUDED_IP). 网卡: \$IFACE, 速率: \$RATE"
+    EXCLUSION_ACTIVE=true
+fi
+
+# Check if the network interface is valid
+if ! ip link show "\$IFACE" &>/dev/null; then
+    log "ERROR: Network interface '\$IFACE' does not exist or is invalid. Exiting."
+    exit 1 # Exit with error, lock file removed by trap
+fi
+
+# --- TC Rule Setup ---
+# 1. Attempt to delete existing root qdisc
+log "Attempting to delete existing root qdisc on \$IFACE..."
+if tc qdisc del dev "\$IFACE" root 2>/dev/null; then
+    log "Successfully deleted existing root qdisc (or none existed)."
+else
+    # This might happen if deletion fails, but maybe add can still succeed if state is weird
+    log "Note: Failed to explicitly delete root qdisc. Continuing attempt to add..."
+fi
+
+# 2. Add the root HTB qdisc
+log "Attempting to add HTB root qdisc (handle 1:) on \$IFACE..."
+if ! tc qdisc add dev "\$IFACE" root handle 1: htb default 999; then
+    log "CRITICAL ERROR: Failed to create root HTB qdisc (handle 1:). Cannot apply limits. Check for conflicts or kernel issues. Exiting."
+    # Explicitly exit 1 - trap will handle lock file removal
     exit 1
-}
-# 默认类，用于未匹配的流量 (速率设置较高，基本不限速)
-tc class add dev \$IFACE parent 1: classid 1:999 htb rate 10000mbit || {
-    log "错误：创建默认 tc class 失败"
-    # 不退出，尝试继续
-}
+fi
+log "Successfully added HTB root qdisc."
 
-# 获取当前所有已建立连接的唯一公共 IP 地址 (TCP 和 UDP)
-# 排除 SSH 端口 (22) 和私有/特殊 IP
+# 3. Add the default class (for unclassified traffic)
+log "Attempting to add default class (1:999) for unclassified traffic..."
+if ! tc class add dev "\$IFACE" parent 1: classid 1:999 htb rate 10000mbit; then
+    log "ERROR: Failed to create default tc class (1:999). Unclassified traffic might be affected. Continuing..."
+    # Don't exit here, main limiting might still work
+else
+    log "Successfully added default class (1:999)."
+fi
+
+# --- IP Detection and Limiting ---
+log "Detecting connected public IP addresses..."
+# Get established TCP (non-SSH) and UDP remote IPs
 TCP_IPS=\$(ss -tn state established '( dport != :22 )' | awk 'NR>1 {print \$4}' | cut -d: -f1)
-UDP_IPS=\$(ss -un state established | awk 'NR>1 {print \$5}' | cut -d: -f1) # UDP 'established' state is less strict but useful for protocols like Hysteria
+UDP_IPS=\$(ss -un state established | awk 'NR>1 {print \$5}' | cut -d: -f1) # Gets remote addr for UDP 'established'
 
-# Combine, filter, and sort unique IPs
-CONNECTED_IPS=\$(echo -e "\$TCP_IPS\n\$UDP_IPS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|0\.0\.0\.0)' | sort -u)
+# Combine, filter for valid public IPv4, and sort unique IPs
+CONNECTED_IPS=\$(echo -e "\$TCP_IPS\n\$UDP_IPS" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -vE '^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|22[4-9]\.|23[0-9]\.|24[0-9]\.|25[0-5]\.)' | sort -u)
 
-# Filter IPv6 if needed (adjust regex as necessary)
-# CONNECTED_IPV6=$(ss -t6n state established '( dport != :22 )' | awk 'NR>1 {print $4}' | sed -e 's/\[//' -e 's/\]:.*$//' | grep -vE '^(::1|fe80::|fc00::|fd00::|ff00::)' | sort -u)
-# COMBINED_IPS="\${CONNECTED_IPS}\n\${CONNECTED_IPV6}"
-# CONNECTED_IPS=\$(echo -e "\$COMBINED_IPS" | sort -u)
+# (Optional: Add IPv6 detection here if needed, similar filtering)
 
-# log "检测到的 IP 列表: \$CONNECTED_IPS" # Debugging: uncomment to see all IPs
+DETECTED_COUNT=\$(echo "\$CONNECTED_IPS" | wc -w)
+log "Found \$DETECTED_COUNT unique public IPs to potentially limit."
+# log "IP List: \$CONNECTED_IPS" # Uncomment for debugging
 
-# 为检测到的 IP 创建限速类和过滤器
-IP_COUNT=0
-CLASS_NUM=10 # Starting class number to avoid conflicts (must be > 0)
+LIMITED_IP_COUNT=0
+CLASS_NUM=10 # Starting class number (e.g., 1:10, 1:11...)
 
 for IP in \$CONNECTED_IPS; do
-    # --- NO EXCLUSION CHECK IN THIS VERSION ---
+    SKIP_IP=false
 
-    CLASS_ID="1:\$CLASS_NUM" # Format like 1:10, 1:11, ...
+    # Check for exclusion if the mode requires it (should be false here)
+    if [ "\$EXCLUSION_ACTIVE" = true ] && [ "\$IP" = "\$EXCLUDED_IP" ]; then
+        log "Skipping excluded IP: \$IP" # Should not happen in this version
+        SKIP_IP=true
+    fi
 
-    # Add HTB class for this IP with the specified rate limit
-    tc class add dev \$IFACE parent 1: classid \$CLASS_ID htb rate \$RATE burst \$BURST || {
-        log "错误: 为 IP \$IP 创建 tc class \$CLASS_ID 失败"
-        continue # Skip to next IP if class creation fails
-    }
+    if [ "\$SKIP_IP" = false ]; then
+        CLASS_ID="1:\$CLASS_NUM" # Class ID like 1:10, 1:11
 
-    # Add SFQ for fair queuing within the limited class
-    tc qdisc add dev \$IFACE parent \$CLASS_ID handle \$CLASS_NUM: sfq perturb 10 || {
-        log "警告: 为 IP \$IP (Class \$CLASS_ID) 创建 tc qdisc sfq \$CLASS_NUM: 失败"
-        # Don't exit, limiting might still work without SFQ, just less fair
-    }
+        # Add HTB class for this IP
+        if ! tc class add dev "\$IFACE" parent 1: classid \$CLASS_ID htb rate "\$RATE" burst "\$BURST"; then
+            log "ERROR: Failed to add tc class \$CLASS_ID for IP \$IP."
+            continue # Skip to next IP
+        fi
 
-    # Add filters to direct traffic FROM and TO this IP into its class
-    # Priority 1 catches all IP traffic (TCP, UDP, ICMP etc.) for this IP
-    tc filter add dev \$IFACE parent 1: protocol ip prio 1 u32 match ip dst \$IP/32 flowid \$CLASS_ID || log "错误: 为 IP \$IP 添加 dst 过滤器失败"
-    tc filter add dev \$IFACE parent 1: protocol ip prio 1 u32 match ip src \$IP/32 flowid \$CLASS_ID || log "错误: 为 IP \$IP 添加 src 过滤器失败"
+        # Add SFQ qdisc to the class for fairness
+        if ! tc qdisc add dev "\$IFACE" parent \$CLASS_ID handle \$CLASS_NUM: sfq perturb 10; then
+            log "WARN: Failed to add SFQ qdisc (\$CLASS_NUM:) to class \$CLASS_ID for IP \$IP. Fairness might be reduced."
+            # Continue even if SFQ fails, limiting should still work
+        fi
 
-    IP_COUNT=\$((IP_COUNT + 1))
-    CLASS_NUM=\$((CLASS_NUM + 1))
+        # Add filters to direct traffic for this IP to its class
+        # Filter for traffic DESTINED TO the IP
+        if ! tc filter add dev "\$IFACE" parent 1: protocol ip prio 1 u32 match ip dst "\$IP/32" flowid \$CLASS_ID; then
+             log "ERROR: Failed to add DST filter for IP \$IP to class \$CLASS_ID."
+             # Consider cleaning up the class if filter fails? For now, just log.
+             continue # Skip to next IP if filter fails
+        fi
+         # Filter for traffic ORIGINATING FROM the IP
+        if ! tc filter add dev "\$IFACE" parent 1: protocol ip prio 1 u32 match ip src "\$IP/32" flowid \$CLASS_ID; then
+            log "ERROR: Failed to add SRC filter for IP \$IP to class \$CLASS_ID."
+             continue # Skip to next IP if filter fails
+        fi
+
+        # Increment counters only if all steps succeeded for this IP
+        LIMITED_IP_COUNT=\$((LIMITED_IP_COUNT + 1))
+        CLASS_NUM=\$((CLASS_NUM + 1))
+    fi
 done
 
-log "已为 \$IP_COUNT 个 IP 设置 \$RATE 限速"
+# --- Final Log ---
+if [ "\$EXCLUSION_ACTIVE" = true ]; then
+    # Should not happen in this version
+    log "Finished applying limits. Limited \$LIMITED_IP_COUNT out of \$DETECTED_COUNT detected public IPs (Excluded: \$EXCLUDED_IP). Rate: \$RATE."
+else
+    log "Finished applying limits. Limited \$LIMITED_IP_COUNT out of \$DETECTED_COUNT detected public IPs. Rate: \$RATE."
+fi
+
+# --- End of Script ---
+# Lock file is removed by the trap automatically here
+exit 0
 EOF
 
     chmod +x /usr/local/scripts/ip-bandwidth-limiter.sh
-    echo -e "${GREEN}[成功]${PLAIN} 限速脚本已创建: /usr/local/scripts/ip-bandwidth-limiter.sh"
+    echo -e "${GREEN}[成功]${PLAIN} 限速工作脚本已创建: /usr/local/scripts/ip-bandwidth-limiter.sh"
 }
 
 # 创建监控脚本 (可选) - (Identical to Version 1)
@@ -235,12 +338,13 @@ if command -v vnstat &>/dev/null; then
     vnstat -l -i \$IFACE
 elif command -v iftop &>/dev/null; then
     echo "未找到 vnstat，尝试使用 iftop (按 Q 退出)..."
-    iftop -i \$IFACE -N -P -t -L 100 # -N: no dns, -P: show ports, -t: text mode, -L: lines
+     # -N: no dns, -P: show ports, -t: text mode (run once), -L: lines, -s 1: update every 1 sec
+    iftop -i \$IFACE -N -P -L 100 -t -s 1
 else
     echo "未安装 vnstat 或 iftop。请运行:"
-    echo "  apt install vnstat"
+    echo "  sudo apt update && sudo apt install vnstat"
     echo "或"
-    echo "  apt install iftop"
+    echo "  sudo apt update && sudo apt install iftop"
 fi
 EOF
 
@@ -248,7 +352,7 @@ EOF
     echo -e "${GREEN}[成功]${PLAIN} 监控脚本已创建: /usr/local/scripts/monitor-bandwidth.sh"
 }
 
-# 设置 systemd 服务和定时器 - (Identical to Version 1)
+# 设置 systemd 服务和定时器 - (Identical to Version 1, passes empty EXCLUDED_IP)
 setup_service() {
     echo -e "${BLUE}[信息]${PLAIN} 设置系统服务和定时器..."
 
@@ -260,16 +364,21 @@ setup_service() {
     # Create systemd service unit
     cat > /etc/systemd/system/ip-bandwidth-limiter.service << EOF
 [Unit]
-Description=IP Bandwidth Limiter Service
+Description=IP Bandwidth Limiter Service ($IFACE_DEFAULT)
 After=network.target
 
 [Service]
 Type=simple
+# Pass necessary variables as environment variables explicitly
+Environment="IFACE_DEFAULT=$IFACE_DEFAULT"
+Environment="RATE=$RATE"
+Environment="BURST=$BURST"
+Environment="LOG_FILE=$LOG_FILE"
+Environment="EXCLUDED_IP=$EXCLUDED_IP" # Pass exclusion IP (will be empty)
 ExecStart=/usr/local/scripts/ip-bandwidth-limiter.sh
 Restart=on-failure
 RestartSec=15s
 # User=root (Default)
-# Environment variables used by the script are set within the script itself
 
 [Install]
 WantedBy=multi-user.target
@@ -278,7 +387,7 @@ EOF
     # Create systemd timer unit
     cat > /etc/systemd/system/ip-bandwidth-limiter.timer << EOF
 [Unit]
-Description=Run IP Bandwidth Limiter periodically (every $TIMER_INTERVAL seconds)
+Description=Run IP Bandwidth Limiter periodically (every $TIMER_INTERVAL seconds for $IFACE_DEFAULT)
 
 [Timer]
 # Run N seconds after boot, and then every N seconds
@@ -286,6 +395,7 @@ OnBootSec=${TIMER_INTERVAL}s
 OnUnitActiveSec=${TIMER_INTERVAL}s
 AccuracySec=1s # Allow some tolerance
 Unit=ip-bandwidth-limiter.service # Specifies the service unit to activate
+Persistent=true # Run missed jobs if the system was down
 
 [Install]
 WantedBy=timers.target
@@ -294,14 +404,17 @@ EOF
     systemctl daemon-reload
 
     # Stop any potentially old running instances before enabling/starting timer
-    systemctl stop ip-bandwidth-limiter.service 2>/dev/null
     systemctl stop ip-bandwidth-limiter.timer 2>/dev/null
+    systemctl stop ip-bandwidth-limiter.service 2>/dev/null
+
 
     # Enable and start the TIMER only. The timer will trigger the service.
+    echo -e "${BLUE}* Enabling timer...${PLAIN}"
     systemctl enable ip-bandwidth-limiter.timer || {
         echo -e "${RED}[错误]${PLAIN} 无法启用定时器 ip-bandwidth-limiter.timer"
         exit 1
     }
+     echo -e "${BLUE}* Starting timer...${PLAIN}"
     systemctl start ip-bandwidth-limiter.timer || {
         echo -e "${RED}[错误]${PLAIN} 无法启动定时器 ip-bandwidth-limiter.timer"
         # Attempt to show status for debugging
@@ -345,10 +458,15 @@ systemctl daemon-reload
 # Remove TC rules
 IFACE_TO_CLEAR="$IFACE_DEFAULT" # Use the interface detected during installation
 if [ -z "\$IFACE_TO_CLEAR" ]; then
-    echo "警告：无法自动检测用于清除规则的接口。您可能需要手动运行 'tc qdisc del dev <your_interface> root'"
+    # Attempt auto-detection again as a fallback
+    IFACE_TO_CLEAR=\$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || ip link | grep -E '^[0-9]+: ' | grep -v 'lo:' | head -n1 | awk '{print \$2}' | cut -d: -f1)
+fi
+
+if [ -z "\$IFACE_TO_CLEAR" ]; then
+     echo "警告：无法自动检测用于清除规则的接口。您可能需要手动运行 'sudo tc qdisc del dev <your_interface> root'"
 else
     echo "清除接口 \$IFACE_TO_CLEAR 上的 tc 规则..."
-    tc qdisc del dev \$IFACE_TO_CLEAR root 2>/dev/null || echo "接口 \$IFACE_TO_CLEAR 上没有找到根 qdisc 或清除失败。"
+    tc qdisc del dev \$IFACE_TO_CLEAR root 2>/dev/null || echo "接口 \$IFACE_TO_CLEAR 上没有找到根 qdisc 或清除失败（可能已被移除）。"
 fi
 
 # Remove script files and log
@@ -357,13 +475,14 @@ rm -f /usr/local/scripts/ip-bandwidth-limiter.sh
 rm -f /usr/local/scripts/monitor-bandwidth.sh
 rm -f /usr/local/scripts/uninstall-limiter.sh
 rm -f "$LOG_FILE"
+rm -f /run/ip-limiter-\${IFACE_TO_CLEAR:-default}.lock # Remove lock file
 
 # Attempt to remove directory if empty
 rmdir /usr/local/scripts 2>/dev/null || echo "目录 /usr/local/scripts 非空，未删除。"
 
 echo ""
 echo -e "${GREEN}IP 带宽限速器已卸载！${PLAIN}"
-echo "如果您不再需要 vnstat，可以手动卸载: apt remove vnstat"
+echo "如果您不再需要 vnstat，可以手动卸载: sudo apt remove vnstat"
 EOF
 
     chmod +x /usr/local/scripts/uninstall-limiter.sh
@@ -412,13 +531,14 @@ main() {
 
     check_root
     check_os
-    check_interface # Check and potentially ask for interface early
+    check_interface # Check interface
 
     echo -e "${YELLOW}此脚本将为 ${RED}所有${PLAIN} 检测到的公共连接 IP 设置 ${GREEN}$RATE${PLAIN} 带宽限制"
     echo -e "${YELLOW}将在网卡 ${GREEN}$IFACE_DEFAULT${PLAIN} 上应用规则"
+    echo -e "${YELLOW}定时器将每 ${GREEN}$TIMER_INTERVAL${PLAIN} 秒运行一次脚本"
     echo -e ""
 
-    read -p "是否继续安装？(y/n): " choice
+    read -p "确认配置无误并继续安装吗？(y/n): " choice
     [[ ! "$choice" =~ ^[Yy]$ ]] && echo "安装已取消" && exit 0
 
     MONITOR_INSTALL="n" # Default to not installing monitor
@@ -435,10 +555,11 @@ main() {
 
     echo -e ""
     echo -e "${BLUE}[信息]${PLAIN} 正在首次运行限速脚本以应用规则..."
-    if bash /usr/local/scripts/ip-bandwidth-limiter.sh; then
+     # Run manually once, ensuring environment variables are passed
+    if sudo IFACE_DEFAULT="$IFACE_DEFAULT" RATE="$RATE" BURST="$BURST" LOG_FILE="$LOG_FILE" EXCLUDED_IP="$EXCLUDED_IP" bash /usr/local/scripts/ip-bandwidth-limiter.sh; then
         echo -e "${GREEN}[成功]${PLAIN} 首次运行完成。"
     else
-        echo -e "${RED}[错误]${PLAIN} 首次运行限速脚本失败。请检查日志: $LOG_FILE"
+        echo -e "${RED}[错误]${PLAIN} 首次运行限速脚本失败。请检查日志: $LOG_FILE 或 systemd 日志: journalctl -u ip-bandwidth-limiter.service -n 50"
     fi
     echo -e ""
 
