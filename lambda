@@ -1,0 +1,339 @@
+import json
+import boto3
+import calendar
+import os
+import time
+from datetime import datetime, date, time as dt_time, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from botocore.config import Config
+
+# 环境变量和常量配置
+SNS_TOPIC = os.environ['SNS_TOPIC']
+REGIONS = [
+    'us-west-2',      # 俄勒冈
+    'us-east-1',      # 佛吉尼亚
+    'ap-southeast-1', # 新加坡
+    'ap-northeast-1', # 日本
+    'ap-northeast-2', # 首尔
+    'eu-west-2',      # 伦敦
+    'eu-central-1'    # 法兰克福
+]
+MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '4'))
+DYNAMODB_TABLE = 'NotifiedInstances'
+QUOTA_CACHE_TABLE = 'InstanceQuotaCache'
+USAGE_THRESHOLD = float(os.environ.get('USAGE_THRESHOLD', '95.0'))  # 默认95%阈值
+CACHE_TTL_DAYS = int(os.environ.get('CACHE_TTL_DAYS', '7'))  # 缓存有效期，默认7天
+
+# AWS客户端配置，增加重试和超时设置
+aws_config = Config(
+    retries={'max_attempts': 3, 'mode': 'standard'},
+    connect_timeout=5,
+    read_timeout=10
+)
+
+# 初始化DynamoDB
+dynamodb = boto3.resource('dynamodb', region_name='ap-southeast-1', config=aws_config)
+notify_table = dynamodb.Table(DYNAMODB_TABLE)
+quota_cache_table = dynamodb.Table(QUOTA_CACHE_TABLE)
+
+def get_current_month_first_day_zero_time():
+    """获取当前月份第一天的零点时间"""
+    today = date.today()
+    first_day = today.replace(day=1)
+    first_day_zero_time = datetime.combine(first_day, dt_time.min)
+    return first_day_zero_time
+
+def get_current_month_last_day_last_time():
+    """获取当前月份最后一天的最后时刻"""
+    today = date.today()
+    last_day = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+    last_day_last_time = datetime.combine(last_day, dt_time(23, 59, 59))
+    return last_day_last_time
+
+def stop_instance(instance_name, region):
+    """停止指定区域的实例"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    try:
+        response = client.stop_instance(
+            instanceName=instance_name,
+            force=True
+        )
+        print(f"Region: {region}, Successfully stopped instance: {instance_name}")
+        return True
+    except client.exceptions.NotFoundException:
+        print(f"Region: {region}, Instance {instance_name} not found, cannot stop")
+        return False
+    except Exception as e:
+        print(f"Region: {region}, Error stopping instance {instance_name}: {str(e)}")
+        return False
+
+def start_instance(instance_name, region):
+    """启动指定区域的实例"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    instance_key = f"{region}:{instance_name}"
+    try:
+        response = client.start_instance(
+            instanceName=instance_name
+        )
+        print(f"Region: {region}, Successfully started instance: {instance_name}")
+        try:
+            notify_table.delete_item(Key={'InstanceKey': instance_key})
+            print(f"Removed notification record for {instance_key} from DynamoDB")
+        except Exception as e:
+            print(f"Failed to remove {instance_key} from DynamoDB: {e}")
+        return True
+    except client.exceptions.NotFoundException:
+        print(f"Region: {region}, Instance {instance_name} not found, cannot start")
+        return False
+    except client.exceptions.InvalidStateException:
+        print(f"Region: {region}, Instance {instance_name} is already running or in an invalid state, skipping start")
+        return False
+    except Exception as e:
+        print(f"Region: {region}, Error starting instance {instance_name}: {str(e)}")
+        return False
+
+def list_instances(instances_list, region):
+    """列出指定区域的所有实例"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    try:
+        paginator = client.get_paginator('get_instances')
+        page_iterator = paginator.paginate()
+        instance_found = False
+        for page in page_iterator:
+            for instance in page['instances']:
+                state = instance['state']['name']
+                print(f"Region: {region}, Instance: {instance['name']}, State: {state}")
+                instances_list.append((instance['name'], region, state))
+                instance_found = True
+        if not instance_found:
+            print(f"Region: {region}, No instances found, skipping...")
+    except Exception as e:
+        print(f"Error listing instances in region {region}: {str(e)}")
+
+def get_cached_quota(instance_name, region):
+    """从DynamoDB缓存获取实例配额"""
+    instance_key = f"{region}:{instance_name}"
+    try:
+        response = quota_cache_table.get_item(Key={'InstanceKey': instance_key})
+        if 'Item' in response:
+            item = response['Item']
+            ttl = item.get('TTL', 0)
+            current_time = int(time.time())
+            if ttl > current_time:
+                print(f"Region: {region}, Using cached quota for {instance_name}: {item['Quota']}GB")
+                return float(item['Quota'])
+            else:
+                print(f"Region: {region}, Cached quota for {instance_name} expired, fetching new quota")
+        return None
+    except dynamodb.meta.client.exceptions.ResourceNotFoundException:
+        print(f"Quota cache table not found, falling back to API for {instance_name}")
+        return None
+    except Exception as e:
+        print(f"Error retrieving cached quota for {instance_key}: {e}")
+        return None
+
+def cache_quota(instance_name, region, quota):
+    """缓存实例配额到DynamoDB"""
+    instance_key = f"{region}:{instance_name}"
+    ttl = int(time.time()) + (CACHE_TTL_DAYS * 86400)  # 当前时间 + 缓存天数
+    try:
+        quota_cache_table.put_item(Item={
+            'InstanceKey': instance_key,
+            'Quota': quota,
+            'TTL': ttl,
+            'UpdatedAt': datetime.now().isoformat()
+        })
+        print(f"Cached quota for {instance_key}: {quota}GB, expires at {datetime.fromtimestamp(ttl).isoformat()}")
+        return True
+    except Exception as e:
+        print(f"Error caching quota for {instance_key}: {e}")
+        return False
+
+def get_month_dto_quota(instance_name, region, instance_state):
+    """获取实例的月度数据传输配额 - 使用缓存优化"""
+    if instance_state == 'stopped':
+        cached_quota = get_cached_quota(instance_name, region)
+        if cached_quota is not None:
+            return instance_name, region, cached_quota
+    
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    try:
+        response = client.get_instance(
+            instanceName=instance_name
+        )
+        dto_quota = response['instance']['networking']['monthlyTransfer']['gbPerMonthAllocated']
+        state = response['instance']['state']['name']
+        print(f"Region: {region}, Instance: {instance_name}, full quota: {dto_quota}GB, state: {state}")
+        
+        cache_quota(instance_name, region, dto_quota)
+        
+        return instance_name, region, dto_quota
+    except client.exceptions.NotFoundException:
+        print(f"Region: {region}, Instance {instance_name} not found, skipping...")
+        return instance_name, region, None
+    except Exception as e:
+        print(f"Error getting quota for {instance_name} in {region}: {str(e)}")
+        return instance_name, region, None
+
+def get_instance_metrics(instance_name, region):
+    """同时获取NetworkIn和NetworkOut数据，减少API调用次数"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    start_time = get_current_month_first_day_zero_time()
+    end_time = get_current_month_last_day_last_time()
+    start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    metrics = {}
+    
+    for metric_name in ["NetworkIn", "NetworkOut"]:
+        try:
+            response = client.get_instance_metric_data(
+                instanceName=instance_name,
+                metricName=metric_name,
+                period=6 * 600 * 24,
+                unit='Bytes',
+                statistics=['Sum'],
+                startTime=start_time_str,
+                endTime=end_time_str
+            )
+            data_points = response['metricData']
+            total_usage = sum([data_point['sum'] for data_point in data_points])
+            metrics[metric_name] = total_usage
+            print(f"Region: {region}, Instance: {instance_name}, {metric_name}: {total_usage} bytes")
+        except client.exceptions.NotFoundException:
+            print(f"Region: {region}, Instance {instance_name} not found, skipping {metric_name}...")
+            metrics[metric_name] = 0
+        except Exception as e:
+            print(f"Error getting {metric_name} for {instance_name} in {region} after retries: {str(e)}")
+            metrics[metric_name] = 0
+    
+    return instance_name, region, metrics
+
+def push_notification(arn, msg):
+    """发送SNS通知"""
+    sns_client = boto3.client('sns', region_name='ap-southeast-1', config=aws_config)
+    try:
+        print(f"Sending notification to SNS topic: {arn}")
+        response = sns_client.publish(
+            TopicArn=arn,
+            Message=msg,
+            Subject=f'Lightsail NetworkOut reached {USAGE_THRESHOLD}% of quota'
+        )
+        print(f"Notification sent successfully, message ID: {response.get('MessageId', 'unknown')}")
+        return True
+    except Exception as e:
+        print(f"Failed to send SNS notification: {str(e)}")
+        return False
+
+def has_notified(instance_key):
+    """检查实例是否已经被通知过"""
+    try:
+        response = notify_table.get_item(Key={'InstanceKey': instance_key})
+        return 'Item' in response
+    except Exception as e:
+        print(f"Error checking DynamoDB for {instance_key}: {e}")
+        return False
+
+def mark_notified(instance_key):
+    """标记实例已被通知"""
+    try:
+        notify_table.put_item(Item={
+            'InstanceKey': instance_key,
+            'NotifiedAt': datetime.now().isoformat()
+        })
+        print(f"Marked {instance_key} as notified in DynamoDB")
+        return True
+    except Exception as e:
+        print(f"Error marking {instance_key} in DynamoDB: {e}")
+        return False
+
+def lambda_handler(event, context):
+    """Lambda处理函数"""
+    start_time = time.time()
+    print(f"Starting Lightsail traffic monitoring at {datetime.now().isoformat()}")
+    
+    # 获取所有区域的实例列表
+    instance_list = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        executor.map(lambda region: list_instances(instance_list, region), REGIONS)
+    
+    # 如果是月初第一天，只启动停止的实例
+    if date.today().day == 1:
+        print("It's the first day of the month, attempting to start stopped instances...")
+        stopped_instances = [(i[0], i[1]) for i in instance_list if i[2] == 'stopped']
+        if stopped_instances:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                executor.map(lambda x: start_instance(x[0], x[1]), stopped_instances)
+        else:
+            print("No stopped instances found to start.")
+    
+    # 获取所有实例的流量配额
+    quotas = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_instance = {executor.submit(get_month_dto_quota, i[0], i[1], i[2]): i for i in instance_list}
+        for future in as_completed(future_to_instance):
+            instance_name, region, quota = future.result()
+            if quota is not None:
+                quotas[(instance_name, region)] = quota * 1000 * 1000 * 1000  # 转换为字节
+    
+    # 获取所有实例的流量使用情况
+    usage_data = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_metrics = {executor.submit(get_instance_metrics, i[0], i[1]): i for i in instance_list if (i[0], i[1]) in quotas}
+        for future in as_completed(future_to_metrics):
+            instance_name, region, metrics = future.result()
+            usage_data[(instance_name, region)] = metrics
+    
+    # 检查每个实例的流量使用情况并采取相应行动
+    for instance_name, region, state in instance_list:
+        key = (instance_name, region)
+        if key not in quotas or key not in usage_data:
+            continue
+        
+        quota = quotas[key]
+        metrics = usage_data[key]
+        network_out = metrics.get("NetworkOut", 0)
+        network_in = metrics.get("NetworkIn", 0)
+        total = network_out + network_in
+        
+        if total == 0:
+            continue
+        
+        usage_percent = (total / quota) * 100
+        formatted_usage = f"{total / (1000 * 1000 * 1000):.2f} GB"
+        formatted_quota = f"{quota / (1000 * 1000 * 1000):.2f} GB"
+        
+        msg = (
+            f"Region: {region}, Instance: {instance_name}, State: {state}\n"
+            f"Usage: {formatted_usage} (NetworkOut: {network_out / (1024**3):.2f} GB, NetworkIn: {network_in / (1024**3):.2f} GB)\n"
+            f"Quota: {formatted_quota}\n"
+            f"Usage percent: {usage_percent:.2f}%"
+        )
+        print(msg)
+        
+        instance_key = f"{region}:{instance_name}"
+        if usage_percent >= USAGE_THRESHOLD:
+            if state != 'stopped' and not has_notified(instance_key):
+                print(f"Region: {region}, usage reached {usage_percent:.2f}%, force close instance: {instance_name}")
+                notification_sent = push_notification(SNS_TOPIC, msg)
+                if notification_sent:
+                    mark_notified(instance_key)
+                    stop_instance(instance_name, region)
+            elif state == 'stopped':
+                print(f"Region: {region}, instance {instance_name} is already stopped, skipping notification and stop action")
+            else:
+                print(f"Region: {region}, instance {instance_name} already notified, skipping notification")
+        else:
+            print(f"Region: {region}, instance {instance_name} usage {usage_percent:.2f}% is below {USAGE_THRESHOLD}%, no action taken")
+    
+    execution_time = time.time() - start_time
+    print(f"Traffic monitoring completed at {datetime.now().isoformat()}, execution time: {execution_time:.2f} seconds")
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Traffic monitoring completed!',
+            'executionTime': f"{execution_time:.2f} seconds",
+            'timestamp': datetime.now().isoformat()
+        })
+    }
