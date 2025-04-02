@@ -2,11 +2,7 @@ Lambda
 
 LightsailTrafficMonitor
 
-EventBridge
 
-RunEvery10Minutes
-
-rate(10 minutes)
 
 import json
 import boto3
@@ -225,3 +221,11 @@ def lambda_handler(event, context):
 		}
 	]
 }
+
+
+
+EventBridge
+
+RunEvery10Minutes
+
+rate(10 minutes)
