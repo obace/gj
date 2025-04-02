@@ -1,0 +1,227 @@
+Lambda
+
+LightsailTrafficMonitor
+
+EventBridge
+
+RunEvery10Minutes
+
+rate(10 minutes)
+
+import json
+import boto3
+import calendar
+import time
+from datetime import datetime, date, time as dt_time, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from botocore.config import Config
+
+# 简化配置
+REGIONS = [
+    'us-west-2',      # 俄勒冈
+    'eu-west-3'       # 法国巴黎
+]
+MAX_WORKERS = 2
+USAGE_THRESHOLD = 90.0  # 90%阈值
+
+# AWS客户端配置，增加重试和超时设置
+aws_config = Config(
+    retries={'max_attempts': 3, 'mode': 'standard'},
+    connect_timeout=5,
+    read_timeout=10
+)
+
+def get_current_month_first_day_zero_time():
+    """获取当前月份第一天的零点时间"""
+    today = date.today()
+    first_day = today.replace(day=1)
+    first_day_zero_time = datetime.combine(first_day, dt_time.min)
+    return first_day_zero_time
+
+def get_current_month_last_day_last_time():
+    """获取当前月份最后一天的最后时刻"""
+    today = date.today()
+    last_day = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+    last_day_last_time = datetime.combine(last_day, dt_time(23, 59, 59))
+    return last_day_last_time
+
+def stop_instance(instance_name, region):
+    """停止指定区域的实例"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    try:
+        client.stop_instance(
+            instanceName=instance_name,
+            force=True
+        )
+        print(f"Region: {region}, Successfully stopped instance: {instance_name}")
+        return True
+    except Exception as e:
+        print(f"Region: {region}, Error stopping instance {instance_name}: {str(e)}")
+        return False
+
+def start_instance(instance_name, region):
+    """启动指定区域的实例"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    try:
+        client.start_instance(
+            instanceName=instance_name
+        )
+        print(f"Region: {region}, Successfully started instance: {instance_name}")
+        return True
+    except Exception as e:
+        print(f"Region: {region}, Error starting instance {instance_name}: {str(e)}")
+        return False
+
+def list_instances(region):
+    """列出指定区域的所有实例"""
+    instances_list = []
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    try:
+        paginator = client.get_paginator('get_instances')
+        page_iterator = paginator.paginate()
+        for page in page_iterator:
+            for instance in page['instances']:
+                state = instance['state']['name']
+                print(f"Region: {region}, Instance: {instance['name']}, State: {state}")
+                instances_list.append((instance['name'], region, state))
+    except Exception as e:
+        print(f"Error listing instances in region {region}: {str(e)}")
+    return instances_list
+
+def get_month_dto_quota(instance_name, region):
+    """获取实例的月度数据传输配额"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    try:
+        response = client.get_instance(
+            instanceName=instance_name
+        )
+        dto_quota = response['instance']['networking']['monthlyTransfer']['gbPerMonthAllocated']
+        print(f"Region: {region}, Instance: {instance_name}, full quota: {dto_quota}GB")
+        return dto_quota * 1000 * 1000 * 1000  # 转换为字节
+    except Exception as e:
+        print(f"Error getting quota for {instance_name} in {region}: {str(e)}")
+        return None
+
+def get_instance_metrics(instance_name, region):
+    """同时获取NetworkIn和NetworkOut数据"""
+    client = boto3.client('lightsail', region_name=region, config=aws_config)
+    start_time = get_current_month_first_day_zero_time()
+    end_time = get_current_month_last_day_last_time()
+    start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    metrics = {}
+    
+    for metric_name in ["NetworkIn", "NetworkOut"]:
+        try:
+            response = client.get_instance_metric_data(
+                instanceName=instance_name,
+                metricName=metric_name,
+                period=6 * 600 * 24,
+                unit='Bytes',
+                statistics=['Sum'],
+                startTime=start_time_str,
+                endTime=end_time_str
+            )
+            data_points = response['metricData']
+            total_usage = sum([data_point['sum'] for data_point in data_points])
+            metrics[metric_name] = total_usage
+            print(f"Region: {region}, Instance: {instance_name}, {metric_name}: {total_usage} bytes")
+        except Exception as e:
+            print(f"Error getting {metric_name} for {instance_name} in {region}: {str(e)}")
+            metrics[metric_name] = 0
+    
+    return metrics
+
+def lambda_handler(event, context):
+    """Lambda处理函数"""
+    start_time = time.time()
+    print(f"Starting Lightsail traffic monitoring at {datetime.now().isoformat()}")
+    
+    # 获取所有区域的实例列表
+    all_instances = []
+    for region in REGIONS:
+        region_instances = list_instances(region)
+        all_instances.extend(region_instances)
+    
+    # 如果是月初第一天，启动停止的实例
+    if date.today().day == 1:
+        print("It's the first day of the month, attempting to start stopped instances...")
+        stopped_instances = [(i[0], i[1]) for i in all_instances if i[2] == 'stopped']
+        for instance_name, region in stopped_instances:
+            start_instance(instance_name, region)
+    
+    # 检查每个实例的流量使用情况
+    for instance_name, region, state in all_instances:
+        if state == 'stopped':
+            print(f"Region: {region}, Instance: {instance_name} is already stopped, skipping...")
+            continue
+            
+        # 获取配额
+        quota = get_month_dto_quota(instance_name, region)
+        if quota is None:
+            continue
+            
+        # 获取使用量
+        metrics = get_instance_metrics(instance_name, region)
+        network_out = metrics.get("NetworkOut", 0)
+        network_in = metrics.get("NetworkIn", 0)
+        total = network_out + network_in
+        
+        if total == 0:
+            continue
+        
+        usage_percent = (total / quota) * 100
+        formatted_usage = f"{total / (1000 * 1000 * 1000):.2f} GB"
+        formatted_quota = f"{quota / (1000 * 1000 * 1000):.2f} GB"
+        
+        print(f"Region: {region}, Instance: {instance_name}, Usage: {formatted_usage}, Quota: {formatted_quota}, Usage percent: {usage_percent:.2f}%")
+        
+        # 如果使用量超过阈值，关闭实例
+        if usage_percent >= USAGE_THRESHOLD:
+            print(f"Region: {region}, usage reached {usage_percent:.2f}%, force close instance: {instance_name}")
+            stop_instance(instance_name, region)
+    
+    execution_time = time.time() - start_time
+    print(f"Traffic monitoring completed at {datetime.now().isoformat()}, execution time: {execution_time:.2f} seconds")
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Traffic monitoring completed!',
+            'executionTime': f"{execution_time:.2f} seconds",
+            'timestamp': datetime.now().isoformat()
+        })
+    }
+
+
+
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Effect": "Allow",
+			"Action": "logs:CreateLogGroup",
+			"Resource": "arn:aws:logs:eu-west-3:140667509036:*"
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"logs:CreateLogStream",
+				"logs:PutLogEvents"
+			],
+			"Resource": "arn:aws:logs:eu-west-3:140667509036:log-group:/aws/lambda/LightsailTrafficMonitor:*"
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"lightsail:GetInstances",
+				"lightsail:GetInstance",
+				"lightsail:GetInstanceMetricData",
+				"lightsail:StartInstance",
+				"lightsail:StopInstance"
+			],
+			"Resource": "*"
+		}
+	]
+}
