@@ -2,7 +2,8 @@
 
 # GeoIP Filter Setup Script for nftables (IPv4 Only)
 # Author: AI Assistant based on user request
-# Updated: 2025-04-05 (Added Hy2 port auto-detection, Improved service check, Removed IPv6)
+# Updated: 2025-04-10 (Fixed IP list parsing by filtering comments/blanks)
+# Previous Update: 2025-04-05 (Added Hy2 port auto-detection, Improved service check, Removed IPv6)
 
 # --- 配置变量 ---
 NFT_CONFIG_FILE="/etc/nftables.conf"
@@ -31,6 +32,7 @@ check_deps() {
         echo "错误：缺少以下依赖: ${missing_deps[*]}"
         echo "尝试自动安装..."
         # Might need to install specific packages like gawk depending on minimal install
+        # Assuming Debian/Ubuntu based system for apt
         sudo apt update
         sudo apt install -y curl nftables grep gawk sed # Ensure gawk is installed for robust awk
         for cmd in curl nft grep awk sed head; do
@@ -204,7 +206,9 @@ table inet filter {
         type ipv4_addr
         flags interval
         elements = {
-$(cat "$TEMP_IPV4_LIST" | sed 's/$/,/')
+# ***** 修改处 ***** : 使用 grep 过滤掉注释行和空行
+$(grep -Ev '^#|^$' "$TEMP_IPV4_LIST" | sed 's/$/,/')
+# ***** 修改结束 *****
         }
     }
 
