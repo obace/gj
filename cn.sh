@@ -2,7 +2,7 @@
 
 # GeoIP Filter Setup Script for nftables (IPv4 Only)
 # Author: AI Assistant based on user request
-# Updated: 2025-04-10 (Fixed IP list parsing by filtering comments/blanks)
+# Updated: 2025-04-10 (Added multi-path Hy2 config check, Fixed IP list parsing)
 # Previous Update: 2025-04-05 (Added Hy2 port auto-detection, Improved service check, Removed IPv6)
 
 # --- 配置变量 ---
@@ -110,29 +110,42 @@ get_user_input() {
     echo "--- 用户输入 ---"
     read -p "请输入 VLESS 使用的 TCP 端口 (多个端口用逗号分隔, e.g., 443,8443): " VLESS_TCP_PORTS
 
-    # --- Hysteria2 端口自动检测 ---
-    HY2_CONFIG_FILE="/etc/hysteria/config.yaml"
-    DETECTED_HY2_PORT=""
-    HY2_UDP_PORTS="" # 初始化变量
+    # --- Hysteria2 端口自动检测 (检查多个路径) ---
+    # 定义要检查的配置文件路径列表
+    local hy2_config_paths=("/etc/hysteria/config.yaml" "/root/hy3/config.yaml") # <--- 修改点：检查这两个路径
+    local DETECTED_HY2_PORT=""
+    local FOUND_HY2_CONFIG_FILE=""
+    local hy2_found=false # 标志位，标记是否成功检测到
 
-    if [ -f "$HY2_CONFIG_FILE" ]; then
-        echo "检测到 Hysteria2 配置文件: $HY2_CONFIG_FILE"
-        # 尝试从 'listen:' 行提取端口号 (取最后一个冒号后的数字)
-        DETECTED_HY2_PORT=$(grep -E '^\s*listen:' "$HY2_CONFIG_FILE" | awk -F: '{print $NF}' | grep -o '[0-9]\+' | head -n 1)
+    echo "开始检测 Hysteria2 配置文件及端口..."
+    for config_path in "${hy2_config_paths[@]}"; do
+        echo "检查路径: $config_path"
+        if [ -f "$config_path" ]; then
+            echo "  检测到配置文件: $config_path"
+            # 尝试从 'listen:' 行提取端口号 (取最后一个冒号后的数字)
+            # 使用更健壮的 grep 和 awk 组合，处理可能的空格和注释
+            local potential_port
+            potential_port=$(grep -E '^\s*listen:\s*' "$config_path" | sed 's/#.*//' | awk -F: '{print $NF}' | grep -oE '[0-9]+$' | head -n 1)
 
-        if [[ "$DETECTED_HY2_PORT" =~ ^[0-9]+$ ]]; then
-            echo "成功自动检测到 Hysteria2 UDP 端口: $DETECTED_HY2_PORT"
-            HY2_UDP_PORTS=$DETECTED_HY2_PORT # 使用检测到的端口
+            if [[ "$potential_port" =~ ^[0-9]+$ ]]; then
+                echo "  成功从 $config_path 检测到 Hysteria2 UDP 端口: $potential_port"
+                DETECTED_HY2_PORT=$potential_port
+                FOUND_HY2_CONFIG_FILE=$config_path
+                hy2_found=true
+                break # 找到一个有效的就停止检查
+            else
+                echo "  在 $config_path 中找到 listen 行，但未能提取有效端口号。"
+            fi
         else
-            echo "未能从配置文件中自动检测到有效的 Hysteria2 端口。"
-            DETECTED_HY2_PORT="" # 清空检测变量，以便后续提示用户输入
+            echo "  未找到配置文件: $config_path"
         fi
-    else
-        echo "未找到 Hysteria2 配置文件: $HY2_CONFIG_FILE"
-    fi
+    done
 
-    # 如果自动检测失败或未找到配置文件，则要求用户输入
-    if [ -z "$DETECTED_HY2_PORT" ]; then
+    if [ "$hy2_found" = true ]; then
+        HY2_UDP_PORTS=$DETECTED_HY2_PORT # 使用检测到的端口
+    else
+        echo "未能从任何指定路径自动检测到 Hysteria2 端口。"
+        # 如果自动检测失败，则要求用户输入
         read -p "请输入 Hysteria2 使用的 UDP 端口 (多个端口用逗号分隔, e.g., 12345): " HY2_UDP_PORTS
     fi
     # --- Hysteria2 端口处理结束 ---
@@ -145,6 +158,7 @@ get_user_input() {
         echo "错误：至少需要输入 VLESS TCP 端口或 Hysteria2 UDP 端口。"
         exit 1
     fi
+    # 可以在这里添加更严格的端口号验证 (如检查范围 1-65535)
     if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]]; then
         echo "错误：SSH 端口必须是数字。"
         exit 1
@@ -155,6 +169,9 @@ get_user_input() {
     HY2_UDP_PORTS_SET=$(echo "$HY2_UDP_PORTS" | tr ',' '\n' | awk 'NF' | paste -sd,)
 
     echo "--- 配置确认 ---"
+    if [ "$hy2_found" = true ]; then
+      echo "Hysteria2 配置文件路径 (自动检测): $FOUND_HY2_CONFIG_FILE"
+    fi
     echo "VLESS TCP 端口: ${VLESS_TCP_PORTS_SET:-无}"
     echo "Hysteria2 UDP 端口: ${HY2_UDP_PORTS_SET:-无}"
     echo "SSH 端口: $SSH_PORT"
@@ -165,6 +182,7 @@ get_user_input() {
         exit 0
     fi
 }
+
 
 # --- 下载 GeoIP 列表 ---
 download_ip_lists() {
@@ -206,9 +224,8 @@ table inet filter {
         type ipv4_addr
         flags interval
         elements = {
-# ***** 修改处 ***** : 使用 grep 过滤掉注释行和空行
+# 使用 grep 过滤掉注释行和空行
 $(grep -Ev '^#|^$' "$TEMP_IPV4_LIST" | sed 's/$/,/')
-# ***** 修改结束 *****
         }
     }
 
@@ -285,7 +302,7 @@ EOF
 main() {
     echo "--- GeoIP 防火墙配置脚本 (仅 IPv4) ---"
     check_deps
-    get_user_input
+    get_user_input # 使用了更新后的函数
     download_ip_lists
     apply_nft_rules
 
