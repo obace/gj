@@ -2,8 +2,8 @@
 
 # GeoIP Filter Setup Script for nftables (IPv4 Only)
 # Author: AI Assistant based on user request
-# Updated: 2025-04-10 (Added multi-path Hy2 config check, Fixed IP list parsing)
-# Previous Update: 2025-04-05 (Added Hy2 port auto-detection, Improved service check, Removed IPv6)
+# Updated: 2025-04-10 (Removed SSH port prompt & final confirmation, Hardcoded SSH port 22 allow rule)
+# Previous Update: 2025-04-10 (Corrected comment placement in heredoc, Fixed IP list parsing, Added multi-path Hy2 check)
 
 # --- 配置变量 ---
 NFT_CONFIG_FILE="/etc/nftables.conf"
@@ -31,7 +31,6 @@ check_deps() {
     if [ ${#missing_deps[@]} -ne 0 ]; then
         echo "错误：缺少以下依赖: ${missing_deps[*]}"
         echo "尝试自动安装..."
-        # Might need to install specific packages like gawk depending on minimal install
         # Assuming Debian/Ubuntu based system for apt
         sudo apt update
         sudo apt install -y curl nftables grep gawk sed # Ensure gawk is installed for robust awk
@@ -42,8 +41,9 @@ check_deps() {
             fi
         done
     fi
-    echo "命令依赖检查通过 (curl, nft, grep, awk, sed, head)。" # Updated message
+    echo "命令依赖检查通过 (curl, nft, grep, awk, sed, head)。"
 
+    # --- nftables 服务检查逻辑 (保持不变) ---
     echo "检查 nftables 服务状态..."
     if systemctl is-active --quiet nftables.service; then
         echo "nftables 服务已在运行。"
@@ -51,10 +51,8 @@ check_deps() {
             echo "nftables 服务未设置为开机自启，尝试启用..."
             sudo systemctl enable nftables.service &> /dev/null || echo "警告：设置 nftables 开机自启失败，请手动检查。"
         fi
-        return 0 # 服务正在运行
+        return 0
     fi
-
-    # 如果服务未运行，检查单元文件是否存在
     echo "nftables 服务当前未运行。"
     if ! systemctl cat nftables.service &> /dev/null; then
         echo "错误：无法找到 nftables.service 单元文件。服务可能未正确安装。"
@@ -68,8 +66,6 @@ check_deps() {
              echo "重新安装似乎已添加服务文件，继续尝试启动..."
         fi
     fi
-
-    # --- 现在处理服务存在但未运行的情况 (或刚重装成功) ---
     if systemctl is-enabled nftables.service | grep -q 'masked'; then
         echo "nftables 服务被屏蔽 (masked)，尝试解除屏蔽..."
         sudo systemctl unmask nftables.service
@@ -80,7 +76,6 @@ check_deps() {
             echo "解除屏蔽成功。"
         fi
     fi
-
     echo "尝试启用 nftables 服务 (设置开机自启)..."
     sudo systemctl enable nftables.service
     if ! systemctl is-enabled --quiet nftables.service && ! systemctl is-enabled nftables.service | grep -q 'masked'; then
@@ -88,11 +83,9 @@ check_deps() {
     else
         echo "启用服务设置成功或已启用。"
     fi
-
     echo "尝试启动 nftables 服务..."
     sudo systemctl start nftables.service
     sleep 2
-
     if systemctl is-active --quiet nftables.service; then
         echo "nftables 服务启动成功。"
         return 0
@@ -105,34 +98,30 @@ check_deps() {
     fi
 }
 
-# --- 获取用户输入 ---
+# --- 获取用户输入 (修改后) ---
 get_user_input() {
     echo "--- 用户输入 ---"
     read -p "请输入 VLESS 使用的 TCP 端口 (多个端口用逗号分隔, e.g., 443,8443): " VLESS_TCP_PORTS
 
     # --- Hysteria2 端口自动检测 (检查多个路径) ---
-    # 定义要检查的配置文件路径列表
-    local hy2_config_paths=("/etc/hysteria/config.yaml" "/root/hy3/config.yaml") # <--- 修改点：检查这两个路径
+    local hy2_config_paths=("/etc/hysteria/config.yaml" "/root/hy3/config.yaml")
     local DETECTED_HY2_PORT=""
     local FOUND_HY2_CONFIG_FILE=""
-    local hy2_found=false # 标志位，标记是否成功检测到
+    local hy2_found=false
 
     echo "开始检测 Hysteria2 配置文件及端口..."
     for config_path in "${hy2_config_paths[@]}"; do
         echo "检查路径: $config_path"
         if [ -f "$config_path" ]; then
             echo "  检测到配置文件: $config_path"
-            # 尝试从 'listen:' 行提取端口号 (取最后一个冒号后的数字)
-            # 使用更健壮的 grep 和 awk 组合，处理可能的空格和注释
             local potential_port
             potential_port=$(grep -E '^\s*listen:\s*' "$config_path" | sed 's/#.*//' | awk -F: '{print $NF}' | grep -oE '[0-9]+$' | head -n 1)
-
             if [[ "$potential_port" =~ ^[0-9]+$ ]]; then
                 echo "  成功从 $config_path 检测到 Hysteria2 UDP 端口: $potential_port"
                 DETECTED_HY2_PORT=$potential_port
                 FOUND_HY2_CONFIG_FILE=$config_path
                 hy2_found=true
-                break # 找到一个有效的就停止检查
+                break
             else
                 echo "  在 $config_path 中找到 listen 行，但未能提取有效端口号。"
             fi
@@ -142,45 +131,33 @@ get_user_input() {
     done
 
     if [ "$hy2_found" = true ]; then
-        HY2_UDP_PORTS=$DETECTED_HY2_PORT # 使用检测到的端口
+        HY2_UDP_PORTS=$DETECTED_HY2_PORT
+        echo "使用自动检测到的 Hysteria2 端口: $HY2_UDP_PORTS (来自 $FOUND_HY2_CONFIG_FILE)"
     else
         echo "未能从任何指定路径自动检测到 Hysteria2 端口。"
-        # 如果自动检测失败，则要求用户输入
         read -p "请输入 Hysteria2 使用的 UDP 端口 (多个端口用逗号分隔, e.g., 12345): " HY2_UDP_PORTS
     fi
     # --- Hysteria2 端口处理结束 ---
 
-    read -p "请输入你的 SSH 端口 (默认 22): " SSH_PORT
-    SSH_PORT=${SSH_PORT:-22} # Default to 22 if empty
+    # 移除了 SSH 端口输入
 
-    # 验证端口输入 (简单验证)
+    # 验证端口输入 (至少需要一个服务端口)
     if [[ -z "$VLESS_TCP_PORTS" && -z "$HY2_UDP_PORTS" ]]; then
         echo "错误：至少需要输入 VLESS TCP 端口或 Hysteria2 UDP 端口。"
         exit 1
     fi
-    # 可以在这里添加更严格的端口号验证 (如检查范围 1-65535)
-    if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]]; then
-        echo "错误：SSH 端口必须是数字。"
-        exit 1
-    fi
 
     # 将逗号分隔的端口转换为 nftables set 格式 { port1, port2 }
+    # 全局变量 VLESS_TCP_PORTS_SET 和 HY2_UDP_PORTS_SET 会在这里被赋值
     VLESS_TCP_PORTS_SET=$(echo "$VLESS_TCP_PORTS" | tr ',' '\n' | awk 'NF' | paste -sd,)
     HY2_UDP_PORTS_SET=$(echo "$HY2_UDP_PORTS" | tr ',' '\n' | awk 'NF' | paste -sd,)
 
-    echo "--- 配置确认 ---"
-    if [ "$hy2_found" = true ]; then
-      echo "Hysteria2 配置文件路径 (自动检测): $FOUND_HY2_CONFIG_FILE"
-    fi
-    echo "VLESS TCP 端口: ${VLESS_TCP_PORTS_SET:-无}"
-    echo "Hysteria2 UDP 端口: ${HY2_UDP_PORTS_SET:-无}"
-    echo "SSH 端口: $SSH_PORT"
-    echo "防火墙将只限制 IPv4 流量。"
-    read -p "确认以上信息并继续? (y/N): " CONFIRM
-    if [[ "${CONFIRM,,}" != "y" ]]; then
-        echo "操作已取消。"
-        exit 0
-    fi
+    echo "--- 用户输入处理完成 ---"
+    echo "VLESS TCP 端口规则将应用于: ${VLESS_TCP_PORTS_SET:-无}"
+    echo "Hysteria2 UDP 端口规则将应用于: ${HY2_UDP_PORTS_SET:-无}"
+    echo "(将默认允许来自任何 IP 的 SSH 端口 22 访问)"
+
+    # 移除了最终的 Y/N 确认步骤
 }
 
 
@@ -198,7 +175,7 @@ download_ip_lists() {
     echo "IPv4 列表下载完成。"
 }
 
-# --- 生成并应用 nftables 规则 ---
+# --- 生成并应用 nftables 规则 (修改后) ---
 apply_nft_rules() {
     echo "--- 生成并应用 nftables 规则 ---"
 
@@ -224,7 +201,7 @@ table inet filter {
         type ipv4_addr
         flags interval
         elements = {
-# 使用 grep 过滤掉注释行和空行
+# 下一行使用 grep 过滤掉注释行和空行, 然后用 sed 添加逗号
 $(grep -Ev '^#|^$' "$TEMP_IPV4_LIST" | sed 's/$/,/')
         }
     }
@@ -232,11 +209,14 @@ $(grep -Ev '^#|^$' "$TEMP_IPV4_LIST" | sed 's/$/,/')
     chain input {
         type filter hook input priority 0; policy drop;
 
+        # 基础规则
         iifname lo accept comment "Allow loopback traffic"
         ct state related,established accept comment "Allow established/related connections"
         ct state invalid drop comment "Drop invalid packets"
         ip protocol icmp accept comment "Allow IPv4 ICMP"
-        tcp dport $SSH_PORT accept comment "Allow SSH access"
+
+        # SSH 规则: 默认允许端口 22 (硬编码)
+        tcp dport 22 accept comment "Allow SSH access (port 22)"
 
 EOF
 
@@ -314,7 +294,7 @@ main() {
     echo "       sudo cp $BACKUP_FILE $NFT_CONFIG_FILE && sudo systemctl restart nftables"
     echo "    如果无法 SSH，请使用服务器提供商的控制台/VNC 操作。"
     echo "2. IP 地址列表会变化，你需要定期更新。建议设置 Cron 任务每月重新运行此脚本来更新列表和规则。"
-    echo "3. 当前配置的默认入站策略是 DROP，仅明确允许的流量 (SSH, 相关连接, ICMPv4, 以及来自中国IPv4的 VLESS/Hy2 流量) 可通过。"
+    echo "3. 当前配置的默认入站策略是 DROP，仅明确允许的流量 (SSH 22, 相关连接, ICMPv4, 以及来自中国IPv4的 VLESS/Hy2 流量) 可通过。"
 }
 
 # --- 运行主函数 ---
