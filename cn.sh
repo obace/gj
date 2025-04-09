@@ -290,8 +290,8 @@ main() {
     echo "GeoIP 防火墙规则已配置完成 (仅 IPv4)。"
     echo "重要提示:"
     echo "1. 如果遇到连接问题 (包括 SSH)，请先尝试恢复备份: "
-    echo "     sudo cp $BACKUP_FILE $NFT_CONFIG_FILE && sudo systemctl restart nftables"
-    echo "   如果无法 SSH，请使用服务器提供商的控制台/VNC 操作。"
+    echo "       sudo cp $BACKUP_FILE $NFT_CONFIG_FILE && sudo systemctl restart nftables"
+    echo "    如果无法 SSH，请使用服务器提供商的控制台/VNC 操作。"
     echo "2. IP 地址列表会变化，你需要定期更新。建议设置 Cron 任务每月重新运行此脚本来更新列表和规则。"
     echo "3. 当前配置的默认入站策略是 DROP，仅明确允许的流量 (SSH, 相关连接, ICMPv4, 以及来自中国IPv4的 VLESS/Hy2 流量) 可通过。"
 }
